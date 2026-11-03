@@ -11,8 +11,14 @@ use serde_json::{json, value::RawValue, Value};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{config::Config, signals::ExitFlag};
+
+/// Prune lock id used by electrs (stored by bitcoind as "user:electrs")
+const PRUNE_LOCK_ID: &str = "electrs";
+/// Prune lock id created by bitcoind's `-prunelockheight` option
+const INIT_PRUNE_LOCK_ID: &str = "init";
 
 enum PollResult {
     Done(Result<()>),
@@ -44,6 +50,8 @@ pub struct GetBlockchainInfoResult {
     pub headers: u64,
     pub initialblockdownload: bool,
     pub pruned: bool,
+    /// The first unpruned block (only present if pruning is enabled)
+    pub pruneheight: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -107,19 +115,32 @@ fn jsonrpc_client(config: &Config) -> Result<jsonrpc::Client> {
 
 pub struct Daemon {
     client: jsonrpc::Client,
+    pruned: AtomicBool,
 }
 
 impl Daemon {
-    pub(crate) fn connect(config: &Config, exit_flag: &ExitFlag) -> Result<Self> {
+    /// `prune_lock_height` is the first block not indexed yet: on a pruned node, a prune lock is
+    /// set at this height before waiting for block download, so the blocks needed for indexing
+    /// are kept.
+    pub(crate) fn connect(
+        config: &Config,
+        exit_flag: &ExitFlag,
+        prune_lock_height: usize,
+    ) -> Result<Self> {
         let daemon = Daemon {
             client: jsonrpc_client(config)?,
+            pruned: AtomicBool::new(false),
         };
 
         loop {
             exit_flag
                 .poll()
                 .context("bitcoin RPC polling interrupted")?;
-            match daemon.rpc_poll(config.skip_block_download_wait, config.pruned) {
+            match daemon.rpc_poll(
+                config.skip_block_download_wait,
+                config.pruned,
+                prune_lock_height,
+            ) {
                 PollResult::Done(result) => {
                     result.context("bitcoind RPC polling failed")?;
                     break; // on success, finish polling
@@ -166,13 +187,39 @@ impl Daemon {
         }
     }
 
-    fn rpc_poll(&self, skip_block_download_wait: bool, allow_pruned: bool) -> PollResult {
+    fn rpc_poll(
+        &self,
+        skip_block_download_wait: bool,
+        allow_pruned: bool,
+        prune_lock_height: usize,
+    ) -> PollResult {
         match self.call::<GetBlockchainInfoResult>("getblockchaininfo", &[]) {
             Ok(info) => {
-                if info.pruned && !allow_pruned {
-                    return PollResult::Done(Err(anyhow!(
-                        "electrs requires non-pruned bitcoind node (use --pruned to allow it)"
-                    )));
+                if info.pruned {
+                    if !allow_pruned {
+                        return PollResult::Done(Err(anyhow!(
+                            "electrs requires non-pruned bitcoind node (use --pruned to allow it)"
+                        )));
+                    }
+                    let first_poll = !self.pruned.swap(true, Ordering::Relaxed);
+                    if let Err(err) = self.set_prune_lock(prune_lock_height) {
+                        return PollResult::Done(Err(err));
+                    }
+                    if first_poll {
+                        // our own lock is set, so the `-prunelockheight` lock is not needed anymore
+                        if let Err(err) = self.remove_init_prune_lock() {
+                            return PollResult::Done(Err(err));
+                        }
+                    }
+                    if let Some(pruneheight) = info.pruneheight {
+                        if pruneheight > prune_lock_height as u64 {
+                            return PollResult::Done(Err(anyhow!(
+                                "bitcoind already pruned blocks needed for indexing (pruneheight={}, next block to index={}): reindex bitcoind",
+                                pruneheight,
+                                prune_lock_height
+                            )));
+                        }
+                    }
                 }
                 if skip_block_download_wait {
                     // bitcoind RPC is available, don't wait for block download to finish
@@ -203,6 +250,40 @@ impl Daemon {
                 PollResult::Done(Err(err).context("daemon not available"))
             }
         }
+    }
+
+    /// Move the prune lock to `height` (the first block not indexed yet).
+    /// Does nothing if bitcoind is not pruned.
+    pub(crate) fn update_prune_lock(&self, height: usize) -> Result<()> {
+        if !self.pruned.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.set_prune_lock(height)
+    }
+
+    fn set_prune_lock(&self, height: usize) -> Result<()> {
+        // Requires bitcoind with the `setprunelock` RPC
+        self.call::<Value>(
+            "setprunelock",
+            &[json!(PRUNE_LOCK_ID), json!("add"), json!(height)],
+        )
+        .with_context(|| format!("failed to set prune lock at height {}", height))?;
+        debug!("prune lock set at height {}", height);
+        Ok(())
+    }
+
+    /// Remove the prune lock created by bitcoind's `-prunelockheight` option, if present.
+    fn remove_init_prune_lock(&self) -> Result<()> {
+        let res = self.call::<Value>(
+            "setprunelock",
+            &[json!(INIT_PRUNE_LOCK_ID), json!("remove")],
+        );
+        if let Err(jsonrpc::Error::Rpc(jsonrpc::error::RpcError { code: -8, .. })) = res {
+            return Ok(()); // the lock is not present
+        }
+        res.context("failed to remove initial prune lock")?;
+        info!("removed bitcoind initial prune lock (set by -prunelockheight)");
+        Ok(())
     }
 
     pub(crate) fn estimate_fee(&self, nblocks: u16) -> Result<Option<Amount>> {

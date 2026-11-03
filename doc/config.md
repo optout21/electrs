@@ -8,6 +8,10 @@ If you use automated systems, refer to their documentation first!
 REST API must be **enabled** for block indexing and transaction lookup.
 
 Pruning must be **disabled** for `electrs` to work, unless the `--pruned` option is used.
+With `--pruned`, `bitcoind` must support the prune lock RPCs (`setprunelock`), and `electrs` sets
+a prune lock to keep the blocks that are not indexed yet. Since prune locks are not persisted by
+`bitcoind`, start it with `-prunelockheight=<n>` (at or below the first block not indexed yet)
+to keep the needed blocks until `electrs` connects.
 
 `txindex` is allowed but unnecessary for `electrs`.
 However, you might still need it if you run other services (e.g.`eclair`).

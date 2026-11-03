@@ -17,6 +17,8 @@ pub struct Tracker {
     index: IndexedChain,
     mempool: Mempool,
     ignore_mempool: bool,
+    /// Height of the last prune lock set on bitcoind
+    prune_lock_height: Option<usize>,
 }
 
 impl Tracker {
@@ -33,11 +35,20 @@ impl Tracker {
             index,
             mempool: Mempool::new(&metrics),
             ignore_mempool: config.ignore_mempool,
+            prune_lock_height: None,
         })
     }
 
     pub(crate) fn headers(&self) -> &bindex::Headers {
         self.index.headers()
+    }
+
+    /// Height of the first block not indexed yet
+    pub(crate) fn next_height(&self) -> usize {
+        self.index
+            .headers()
+            .tip_height()
+            .map_or(0, |height| height + 1)
     }
 
     pub(crate) fn fees_histogram(&self) -> &FeeHistogram {
@@ -51,6 +62,12 @@ impl Tracker {
     pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
         exit_flag.poll()?;
         let stats = self.index.sync(1000)?;
+        // keep the blocks that are not indexed yet from being pruned
+        let next_height = self.next_height();
+        if self.prune_lock_height != Some(next_height) {
+            daemon.update_prune_lock(next_height)?;
+            self.prune_lock_height = Some(next_height);
+        }
         let done = stats.indexed_blocks == 0;
         if done && !self.ignore_mempool {
             self.mempool.sync(daemon, exit_flag);

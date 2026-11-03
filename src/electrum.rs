@@ -179,7 +179,7 @@ impl Rpc {
 
         let tracker = Tracker::new(config, metrics)?;
         let signal = Signal::new();
-        let daemon = Daemon::connect(config, signal.exit_flag())?;
+        let daemon = Daemon::connect(config, signal.exit_flag(), tracker.next_height())?;
         Ok(Self {
             tracker,
             rpc_duration,

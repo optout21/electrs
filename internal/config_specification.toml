@@ -112,7 +112,7 @@ doc = "Don't wait for block download to finish before starting sync."
 
 [[switch]]
 name = "pruned"
-doc = "Allow running against a pruned bitcoind."
+doc = "Allow running against a pruned bitcoind (requires a bitcoind with prune lock RPC support). A prune lock is set to keep the blocks that are not indexed yet."
 
 [[switch]]
 name = "version"

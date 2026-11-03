@@ -22,8 +22,13 @@ pub struct Tracker {
 impl Tracker {
     pub fn new(config: &Config, metrics: Metrics) -> Result<Self> {
         let url = format!("http://{}", config.daemon_rpc_addr);
-        let index = IndexedChain::open(&config.db_dir, config.network, Some(url))
-            .context("failed to open index")?;
+        let options = bindex::Options {
+            // the REST API check needs the genesis block, which may be pruned
+            skip_rest_api_check: config.pruned,
+        };
+        let index =
+            IndexedChain::open_with_options(&config.db_dir, config.network, Some(url), options)
+                .context("failed to open index")?;
         Ok(Self {
             index,
             mempool: Mempool::new(&metrics),

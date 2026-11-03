@@ -119,7 +119,7 @@ impl Daemon {
             exit_flag
                 .poll()
                 .context("bitcoin RPC polling interrupted")?;
-            match daemon.rpc_poll(config.skip_block_download_wait) {
+            match daemon.rpc_poll(config.skip_block_download_wait, config.pruned) {
                 PollResult::Done(result) => {
                     result.context("bitcoind RPC polling failed")?;
                     break; // on success, finish polling
@@ -166,12 +166,12 @@ impl Daemon {
         }
     }
 
-    fn rpc_poll(&self, skip_block_download_wait: bool) -> PollResult {
+    fn rpc_poll(&self, skip_block_download_wait: bool, allow_pruned: bool) -> PollResult {
         match self.call::<GetBlockchainInfoResult>("getblockchaininfo", &[]) {
             Ok(info) => {
-                if info.pruned {
+                if info.pruned && !allow_pruned {
                     return PollResult::Done(Err(anyhow!(
-                        "electrs requires non-pruned bitcoind node"
+                        "electrs requires non-pruned bitcoind node (use --pruned to allow it)"
                     )));
                 }
                 if skip_block_download_wait {

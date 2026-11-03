@@ -7,7 +7,7 @@ If you use automated systems, refer to their documentation first!
 
 REST API must be **enabled** for block indexing and transaction lookup.
 
-Pruning must be **disabled** for `electrs` to work.
+Pruning must be **disabled** for `electrs` to work, unless the `--pruned` option is used.
 
 `txindex` is allowed but unnecessary for `electrs`.
 However, you might still need it if you run other services (e.g.`eclair`).

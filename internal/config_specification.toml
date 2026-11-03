@@ -111,6 +111,10 @@ name = "skip_block_download_wait"
 doc = "Don't wait for block download to finish before starting sync."
 
 [[switch]]
+name = "pruned"
+doc = "Allow running against a pruned bitcoind."
+
+[[switch]]
 name = "version"
 doc = "Print out the program version."
 

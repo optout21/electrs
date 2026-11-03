@@ -141,6 +141,7 @@ pub struct Config {
     pub ignore_mempool: bool,
     pub sync_once: bool,
     pub skip_block_download_wait: bool,
+    pub pruned: bool,
     pub disable_electrum_rpc: bool,
     pub server_banner: String,
 }
@@ -319,6 +320,7 @@ impl Config {
             ignore_mempool: config.ignore_mempool,
             sync_once: config.sync_once,
             skip_block_download_wait: config.skip_block_download_wait,
+            pruned: config.pruned,
             disable_electrum_rpc: config.disable_electrum_rpc,
             server_banner: config.server_banner,
         };

@@ -1,7 +1,7 @@
 use crate::bitcoin::{BlockHash, Txid};
 use crate::bitcoin_slices::{bsl, EmptyVisitor, Visit};
 use anyhow::{Context, Result};
-use bindex::IndexedChain;
+use bindex::{IndexedChain, Location};
 
 use crate::{
     config::Config,
@@ -80,9 +80,15 @@ impl Tracker {
         Ok(())
     }
 
-    pub(crate) fn update_scripthash_status(&self, status: &mut ScriptHashStatus) -> Result<bool> {
+    pub(crate) fn update_scripthash_status(
+        &self,
+        daemon: &Daemon,
+        status: &mut ScriptHashStatus,
+    ) -> Result<bool> {
         let prev_statushash = status.statushash();
-        status.sync(&self.index, &self.mempool)?;
+        status.sync(&self.index, &self.mempool, |location| {
+            self.get_tx_bytes(daemon, location)
+        })?;
         Ok(prev_statushash != status.statushash())
     }
 
@@ -90,15 +96,32 @@ impl Tracker {
         status.get_balance()
     }
 
-    pub(crate) fn lookup_transaction(&self, txid: Txid) -> Result<Option<(BlockHash, Box<[u8]>)>> {
+    pub(crate) fn lookup_transaction(
+        &self,
+        daemon: &Daemon,
+        txid: Txid,
+    ) -> Result<Option<(BlockHash, Box<[u8]>)>> {
         // Note: there are two blocks with coinbase transactions having same txid (see BIP-30)
         for loc in self.index.locations_by_txid(&txid)? {
-            let tx_bytes = self.index.get_tx_bytes(&loc)?;
+            let tx_bytes = self.get_tx_bytes(daemon, &loc)?;
             if txid == compute_txid(&tx_bytes)? {
                 return Ok(Some((loc.block_hash(), tx_bytes.into_boxed_slice())));
             }
         }
         Ok(None)
+    }
+
+    /// Fetch a confirmed transaction's bytes from bitcoind. On a pruned node, if the data of its
+    /// block is not available anymore, fetch the block from a peer and retry.
+    fn get_tx_bytes(&self, daemon: &Daemon, location: &Location) -> Result<Vec<u8>> {
+        match self.index.get_tx_bytes(location) {
+            Err(err) if err.is_not_found() && daemon.is_pruned() => {
+                debug!("block {} not available: {}", location.block_hash(), err);
+                daemon.fetch_pruned_block(location.block_hash())?;
+                Ok(self.index.get_tx_bytes(location)?)
+            }
+            res => Ok(res?),
+        }
     }
 }
 

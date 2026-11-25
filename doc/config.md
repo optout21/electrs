@@ -13,6 +13,11 @@ a prune lock to keep the blocks that are not indexed yet. Since prune locks are 
 `bitcoind`, start it with `-prunelockheight=<n>` (at or below the first block not indexed yet)
 to keep the needed blocks until `electrs` connects.
 
+Transactions in blocks that `bitcoind` has already pruned (e.g. for the history of an address)
+are served by fetching the block again from a peer (`getblockfrompeer`), which requires a
+connected peer that serves old blocks. This takes a moment per block, and the peer learns which
+blocks are requested. The fetched blocks are pruned again later.
+
 `txindex` is allowed but unnecessary for `electrs`.
 However, you might still need it if you run other services (e.g.`eclair`).
 

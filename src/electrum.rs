@@ -204,7 +204,7 @@ impl Rpc {
             .scripthashes
             .par_iter_mut()
             .filter_map(|(scripthash, status)| -> Option<Result<Value>> {
-                match self.tracker.update_scripthash_status(status) {
+                match self.tracker.update_scripthash_status(&self.daemon, status) {
                     Ok(true) => Some(Ok(notification(
                         "blockchain.scripthash.subscribe",
                         &[json!(scripthash), json!(status.statushash())],
@@ -383,7 +383,8 @@ impl Rpc {
 
     fn new_status(&self, scripthash: ScriptHash) -> Result<ScriptHashStatus> {
         let mut status = ScriptHashStatus::new(scripthash);
-        self.tracker.update_scripthash_status(&mut status)?;
+        self.tracker
+            .update_scripthash_status(&self.daemon, &mut status)?;
         Ok(status)
     }
 
@@ -427,14 +428,14 @@ impl Rpc {
         if verbose {
             let blockhash = self
                 .tracker
-                .lookup_transaction(txid)?
+                .lookup_transaction(&self.daemon, txid)?
                 .map(|(blockhash, _tx)| blockhash);
             return self.daemon.get_transaction(&txid, blockhash, verbose);
         }
         // use internal index to load confirmed transaction
         if let Some(tx_hex) = self
             .tracker
-            .lookup_transaction(txid)?
+            .lookup_transaction(&self.daemon, txid)?
             .map(|(_blockhash, tx)| tx.to_lower_hex_string())
         {
             return Ok(json!(tx_hex));

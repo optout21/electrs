@@ -12,6 +12,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::{config::Config, signals::ExitFlag};
 
@@ -19,6 +21,13 @@ use crate::{config::Config, signals::ExitFlag};
 const PRUNE_LOCK_ID: &str = "electrs";
 /// Prune lock id created by bitcoind's `-prunelockheight` option
 const INIT_PRUNE_LOCK_ID: &str = "init";
+
+/// How long to wait for a peer to send a block requested with `getblockfrompeer`
+const BLOCK_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often to check whether a requested block has arrived
+const BLOCK_FETCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How many peers to try before giving up on fetching a block
+const BLOCK_FETCH_MAX_PEERS: usize = 3;
 
 enum PollResult {
     Done(Result<()>),
@@ -113,9 +122,19 @@ fn jsonrpc_client(config: &Config) -> Result<jsonrpc::Client> {
     Ok(jsonrpc::Client::with_transport(builder.build()))
 }
 
+#[derive(Deserialize)]
+struct GetPeerInfoResult {
+    id: i64,
+    inbound: bool,
+    #[serde(default)]
+    servicesnames: Vec<String>,
+}
+
 pub struct Daemon {
     client: jsonrpc::Client,
     pruned: AtomicBool,
+    /// Serializes fetching pruned blocks from peers (see `fetch_pruned_block()`)
+    block_fetch_lock: Mutex<()>,
 }
 
 impl Daemon {
@@ -130,6 +149,7 @@ impl Daemon {
         let daemon = Daemon {
             client: jsonrpc_client(config)?,
             pruned: AtomicBool::new(false),
+            block_fetch_lock: Mutex::new(()),
         };
 
         loop {
@@ -319,10 +339,16 @@ impl Daemon {
         blockhash: Option<BlockHash>,
         verbose: bool,
     ) -> Result<Value> {
-        self.call(
-            "getrawtransaction",
-            &[json!(txid), json!(verbose), json!(blockhash)],
-        )
+        let call = || {
+            self.call(
+                "getrawtransaction",
+                &[json!(txid), json!(verbose), json!(blockhash)],
+            )
+        };
+        match blockhash {
+            Some(blockhash) => self.call_with_block(blockhash, call),
+            None => call().map_err(anyhow::Error::from),
+        }
         .context("failed to get transaction")
     }
 
@@ -332,9 +358,98 @@ impl Daemon {
             pub tx: Vec<bitcoin::Txid>,
         }
         let res: GetBlockResult = self
-            .call("getblock", &[json!(blockhash), json!(1)])
+            .call_with_block(blockhash, || {
+                self.call("getblock", &[json!(blockhash), json!(1)])
+            })
             .context("failed to get block txids")?;
         Ok(res.tx)
+    }
+
+    /// Whether bitcoind is pruned (known after connecting)
+    pub(crate) fn is_pruned(&self) -> bool {
+        self.pruned.load(Ordering::Relaxed)
+    }
+
+    /// Run an RPC call that needs the data of block `blockhash`. If it fails because the
+    /// block's data is not available (it has been pruned), fetch the block from a peer and
+    /// retry once.
+    fn call_with_block<T>(
+        &self,
+        blockhash: BlockHash,
+        call: impl Fn() -> Result<T, jsonrpc::Error>,
+    ) -> Result<T> {
+        match call() {
+            Err(err) if self.is_pruned() && is_block_not_available(&err) => {
+                debug!("block {} not available: {}", blockhash, err);
+                self.fetch_pruned_block(blockhash)?;
+                Ok(call()?)
+            }
+            res => Ok(res?),
+        }
+    }
+
+    /// Fetch a block whose data has been pruned from a peer (using `getblockfrompeer`), and
+    /// wait until bitcoind has stored it. The block is kept until bitcoind prunes it again.
+    ///
+    /// Fetches are serialized, so that concurrent requests for the same block don't ask
+    /// peers for it more than once.
+    pub(crate) fn fetch_pruned_block(&self, blockhash: BlockHash) -> Result<()> {
+        let _guard = self.block_fetch_lock.lock().unwrap();
+        if self.has_block_data(blockhash) {
+            return Ok(()); // fetched in the meantime, or never pruned
+        }
+        let peers = self.block_serving_peers()?;
+        if peers.is_empty() {
+            bail!(
+                "block {} is pruned, and no connected peer serves old blocks",
+                blockhash
+            );
+        }
+        for peer_id in peers.into_iter().take(BLOCK_FETCH_MAX_PEERS) {
+            info!("fetching pruned block {} from peer {}", blockhash, peer_id);
+            if let Err(err) =
+                self.call::<Value>("getblockfrompeer", &[json!(blockhash), json!(peer_id)])
+            {
+                if self.has_block_data(blockhash) {
+                    return Ok(()); // e.g. "Block already downloaded"
+                }
+                warn!(
+                    "failed to request block {} from peer {}: {}",
+                    blockhash, peer_id, err
+                );
+                continue;
+            }
+            let deadline = Instant::now() + BLOCK_FETCH_TIMEOUT;
+            while Instant::now() < deadline {
+                if self.has_block_data(blockhash) {
+                    info!("fetched pruned block {}", blockhash);
+                    return Ok(());
+                }
+                std::thread::sleep(BLOCK_FETCH_POLL_INTERVAL);
+            }
+            warn!(
+                "peer {} did not send block {} within {:?}",
+                peer_id, blockhash, BLOCK_FETCH_TIMEOUT
+            );
+        }
+        bail!("failed to fetch pruned block {} from peers", blockhash)
+    }
+
+    /// Whether bitcoind has the data of block `blockhash`
+    fn has_block_data(&self, blockhash: BlockHash) -> bool {
+        self.call::<String>("getblock", &[json!(blockhash), json!(0)])
+            .is_ok()
+    }
+
+    /// Ids of connected peers that serve the full block chain (not only recent blocks),
+    /// outbound peers first.
+    fn block_serving_peers(&self) -> Result<Vec<i64>> {
+        let mut peers: Vec<GetPeerInfoResult> = self
+            .call("getpeerinfo", &[])
+            .context("failed to get peer info")?;
+        peers.retain(|peer| peer.servicesnames.iter().any(|s| s == "NETWORK"));
+        peers.sort_by_key(|peer| peer.inbound);
+        Ok(peers.into_iter().map(|peer| peer.id).collect())
     }
 
     pub(crate) fn get_mempool_info(&self) -> Result<GetMempoolInfoResult> {
@@ -396,6 +511,15 @@ impl Daemon {
             })
             .collect())
     }
+}
+
+/// Whether an RPC error says that a block's data is not available, e.g.
+/// "Block not available (pruned data)" from `getblock` (and `getrawtransaction` with a block
+/// hash), or "Transaction may be in pruned block ..." from `getrawtransaction` in newer
+/// versions of bitcoind.
+fn is_block_not_available(err: &jsonrpc::Error) -> bool {
+    extract_bitcoind_error(err)
+        .is_some_and(|e| e.message.contains("not available") || e.message.contains("pruned block"))
 }
 
 pub(crate) fn extract_bitcoind_error(err: &jsonrpc::Error) -> Option<&jsonrpc::error::RpcError> {

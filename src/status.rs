@@ -4,7 +4,7 @@ use crate::bitcoin::{
     Amount, BlockHash, OutPoint, SignedAmount, Transaction, Txid,
 };
 use anyhow::Result;
-use bindex::{IndexedChain, ScriptHash};
+use bindex::{IndexedChain, Location, ScriptHash};
 use serde::ser::{Serialize, Serializer};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -298,9 +298,13 @@ impl ScriptHashStatus {
             .collect()
     }
 
-    /// Get funding and spending entries from new blocks.
-    /// Also cache relevant transactions and their merkle proofs.
-    fn sync_confirmed(&mut self, index: &IndexedChain) -> Result<HashSet<OutPoint>> {
+    /// Get funding and spending entries from new blocks, using `get_tx_bytes` to fetch the
+    /// transactions. Also cache relevant transactions and their merkle proofs.
+    fn sync_confirmed(
+        &mut self,
+        index: &IndexedChain,
+        get_tx_bytes: impl Fn(&Location) -> Result<Vec<u8>>,
+    ) -> Result<HashSet<OutPoint>> {
         let headers = index.headers();
         let mut latest_header = None;
         // Drop entries from stale blocks
@@ -322,7 +326,7 @@ impl ScriptHashStatus {
         let mut outpoints = self.confirmed_outpoints();
         // Process transactions in chronological order
         for location in index.locations_by_scripthash(&self.scripthash, latest_header)? {
-            let tx_bytes = index.get_tx_bytes(&location)?;
+            let tx_bytes = get_tx_bytes(&location)?;
             let tx = Transaction::consensus_decode_from_finite_reader(&mut &tx_bytes[..])?;
 
             // Check if this transaction has relevant inputs/outputs:
@@ -377,10 +381,15 @@ impl ScriptHashStatus {
         result.into_values().collect()
     }
 
-    /// Sync with currently confirmed txs and mempool, downloading non-cached transactions via REST API.
-    /// After a successful sync, script-hash status is updated.
-    pub(crate) fn sync(&mut self, index: &IndexedChain, mempool: &Mempool) -> Result<()> {
-        let outpoints = self.sync_confirmed(index)?;
+    /// Sync with currently confirmed txs and mempool, downloading non-cached transactions with
+    /// `get_tx_bytes`. After a successful sync, script-hash status is updated.
+    pub(crate) fn sync(
+        &mut self,
+        index: &IndexedChain,
+        mempool: &Mempool,
+        get_tx_bytes: impl Fn(&Location) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        let outpoints = self.sync_confirmed(index, get_tx_bytes)?;
         if !self.confirmed.is_empty() {
             debug!(
                 "{} transactions from {} blocks",

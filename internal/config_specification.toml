@@ -130,7 +130,7 @@ default = "0"
 name = "server_banner"
 type = "String"
 doc = "The banner to be shown in the Electrum console"
-default = "concat!(\"Welcome to electrs \", env!(\"CARGO_PKG_VERSION\"), \" (Electrum Rust Server)!\").to_owned()"
+default = "concat!(\"Welcome to electrs \", env!(\"CARGO_PKG_VERSION\"), \" (PrunedElectrum Rust Server)!\").to_owned()"
 
 [[param]]
 name = "log_filters"
